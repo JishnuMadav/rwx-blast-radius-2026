@@ -120,6 +120,7 @@ def main():
     p.add_argument("--map", type=Path, default=Path(__file__).with_name("coverage.json.gz"))
     p.add_argument("--evidence", type=Path, default=Path(__file__).with_name("semantics.json.gz"))
     p.add_argument("--source", type=Path, default=Path("/opt/sqlglot"))
+    p.add_argument("--lifecycle", type=Path, default=Path(__file__).with_name("lifecycle.json.gz"))
     args = p.parse_args()
     tests = json.loads((args.data / "tests.json").read_bytes())["tests"]
     costs = {t["number"]: round(1000 * t["seconds"]) for t in tests}
@@ -128,8 +129,12 @@ def main():
     evidence = None
     if args.evidence.is_file() and args.source.is_dir():
         from witness import Evidence
+        lifecycle = None
+        if args.lifecycle.is_file():
+            with gzip.open(args.lifecycle, "rb") as f:
+                lifecycle = json.load(f)
         with gzip.open(args.evidence, "rb") as f:
-            evidence = Evidence(args.source, json.load(f), deps)
+            evidence = Evidence(args.source, json.load(f), deps, lifecycle)
     cache = {}
     for patch in sorted((args.data / "commits").glob("*.patch")):
         diff = patch.read_text(encoding="utf8", errors="replace")

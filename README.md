@@ -3,16 +3,19 @@
 For each independent SQLGlot patch, the selector reconstructs the changed
 Python files against the pinned revision. It uses baseline measurements of
 executed lines and functions, fixture and source reads, comparison operands,
-callback invocations and individual dictionary values. It combines the
+callback invocations, individual dictionary values and scalar class settings.
+Independent cold imports cover each test module. Shared setup dependencies
+cover all member tests, including fixtures opened before individual methods run.
+The selector combines the
 selected tests across files and schedules them on one to eight workers,
 including the two-second cost per worker. Unsupported patch formats and
 changes that fail to compile select the full catalog.
 
-On the 30 public sample changes, the organizers' Docker harness reported
-103.410 simulated seconds and zero missed commits, down from 672.524 for
-the line-coverage version. Three local container runs measured total times
-of 105.023, 105.050 and 104.841 seconds including CPU. The sample was used
-during development. The private practice and final batches have different patches.
+The candidate scored 103.410 simulated seconds with zero misses on the 30
+development sample changes. On a separate 40-patch validation batch it scored
+116.500 simulated seconds with zero misses. The previously submitted version
+scored 544.197 simulated seconds on that same batch, including one missed
+commit. The organizer adds CPU time on top of each simulated score.
 
 ## Run the official sample
 
@@ -25,7 +28,7 @@ make -C .local/sample -o build sample IMAGE=rwx-blast-selector OUTPUT=../candida
 python -m unittest test_selector test_witness
 ~~~
 
-The image runs offline using the two included baseline maps and the
+The image runs offline using the included baseline maps and the
 checksum-verified source checkout downloaded during the build. The sample
 answers are used by the external scorer. The reported simulated time excludes
 the selector's CPU time, which the competition adds on its servers.
@@ -41,7 +44,10 @@ Then run:
 python build_map.py .local/sqlglot .local/sample/sample/tests.json coverage.json.gz
 python build_map.py .local/sqlglot .local/sample/sample/tests.json coverage.json.gz --augment-workers
 python verify_coverage.py .local/sqlglot coverage.json.gz coverage.json.gz
-python profile_semantics.py .local/sqlglot .local/sample/sample/tests.json semantics.json.gz
+python profile_semantics.py .local/sqlglot .local/sample/sample/tests.json .local/operand-map.gz
+python profile_scalars.py .local/sqlglot .local/sample/sample/tests.json .local/scalar-map.gz
+python merge_profiles.py semantics.json.gz .local/operand-map.gz .local/scalar-map.gz
+python profile_lifecycle.py .local/sqlglot .local/sample/sample/tests.json lifecycle.json.gz
 ~~~
 
 For a faster semantic profile, start multiple copies with the same

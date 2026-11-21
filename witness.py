@@ -1,13 +1,18 @@
 """Interpret a patch using source and execution evidence from the pinned revision."""
 import ast
+import dis
 from functools import lru_cache
 import gzip
 import json
+import operator
 from pathlib import Path, PurePosixPath
 import re
+import types
 
 
 HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+RELATIONS = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,
+             ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge}
 
 
 def read_patch(text):
@@ -109,7 +114,7 @@ def ancestors(tree, path):
 
 
 class Evidence:
-    def __init__(self, root, data, deps):
+    def __init__(self, root, data, deps, lifecycle=None):
         self.root = root
         self.deps = deps
         self.sites = data["facts"]
@@ -118,6 +123,20 @@ class Evidence:
         self.masks = [int(value, 16) for value in data["masks"]]
         self.startup = 1 << len(deps.ids)
         self.unverified = {deps.number[n] for n in data.get("unverified", ()) if n in deps.number}
+        lifecycle = lifecycle or {"ids": deps.ids, "files": {}, "masks": []}
+        if lifecycle["ids"] != deps.ids:
+            raise ValueError("lifecycle profile catalog differs")
+        self.lifecycle = lifecycle["files"]
+        self.lifecycle_masks = [int(value, 16) for value in lifecycle["masks"]]
+
+    def lifecycle_hits(self, path, lines):
+        covered = self.lifecycle.get(path, {})
+        mask = 0
+        for line in lines:
+            index = covered.get(str(line))
+            if index is not None:
+                mask |= self.lifecycle_masks[index]
+        return self.deps.numbers(mask)
 
     def fact(self, site, key):
         facts = self.sites.get(site, {})
@@ -133,6 +152,19 @@ class Evidence:
         for old, new in reversed(list(zip(a, b))):
             if not isinstance(old, ast.Compare) or not isinstance(new, ast.Compare):
                 continue
+            numeric = f"number:{path}:{old.lineno}:{old.col_offset}"
+            if (numeric in self.sites and len(old.ops) == len(new.ops) == 1
+                and type(old.ops[0]) in RELATIONS and type(new.ops[0]) in RELATIONS
+                and tree_key(old.left) == tree_key(new.left)
+                and all(isinstance(x.comparators[0], ast.Constant) and type(x.comparators[0].value) is int
+                        for x in (old, new))):
+                left_op, right_op = RELATIONS[type(old.ops[0])], RELATIONS[type(new.ops[0])]
+                result = self.fact(numeric, "unknown")
+                for value in self.sites[numeric]:
+                    if value != "unknown" and (left_op(int(value), old.comparators[0].value)
+                                               != right_op(int(value), new.comparators[0].value)):
+                        result |= self.fact(numeric, value)
+                return result
             if (len(old.ops) != 1 or len(new.ops) != 1 or tree_key(old.left) != tree_key(new.left)
                 or tree_key(old.comparators[0]) != tree_key(new.comparators[0])):
                 continue
@@ -198,6 +230,11 @@ class Evidence:
                         return None
                     base = path[:-3].replace("/", ".") + "." + ".".join(classes)
                     site = f"attr:{base}:{target.id}"
+                    scalar = f"scalar:{base}:{target.id}"
+                    if (self.fact(scalar, "installed") and isinstance(old_val, ast.Constant)
+                        and isinstance(new_val, ast.Constant) and type(old_val.value) is type(new_val.value)):
+                        return (self.fact(scalar, "read") | self.fact(f"namespace:{base}", "read")
+                                | self.fact(site, "read"))
                     if site in self.sites:
                         return self.fact(site, "read")
         return None
@@ -218,6 +255,20 @@ class Evidence:
         i, function = scope[-1]
         if i >= len(delta) or delta[i] != "body" or not self.file_entries(path):
             return expanded
+        # A single-line computed expression with its own bytecode line event
+        # cannot influence a test which never entered that statement. Missing
+        # coverage on such an executable line represents zero observed hits.
+        statements = [n for n in a[i + 1:] if isinstance(n, (ast.Return, ast.Assign, ast.Expr, ast.Raise))]
+        if statements and isinstance(b[i], type(function)):
+            stmt = statements[-1]
+            if (stmt.lineno == stmt.end_lineno and stmt.lineno != function.lineno
+                and stmt.lineno in self.executable_lines(path) and self.bindings(function) == self.bindings(b[i])
+                and not any(isinstance(n, (ast.Yield, ast.YieldFrom, ast.Await, ast.Lambda))
+                            for n in (*a, *b)) and isinstance(a[-1], (int, str, float, bool, ast.operator,
+                            ast.unaryop, ast.cmpop)) and isinstance(b[-1], type(a[-1]))):
+                index = self.deps.files.get(path, {}).get(str(stmt.lineno))
+                if index is None:
+                    return set()
         # Altering a dead function body can still affect an inspecting test;
         # callers add source readers separately. Edits to decorators and defaults
         # must be treated as changes to their enclosing scope.
@@ -233,6 +284,18 @@ class Evidence:
         if isinstance(edited, type(function)) and self.bindings(function) != self.bindings(edited):
             return entrants | expanded
         return expanded & entrants
+
+    @lru_cache(maxsize=64)
+    def executable_lines(self, path):
+        code = compile(self.source(path)[0], path, "exec", dont_inherit=True)
+        lines = set()
+        def visit(block):
+            lines.update(n for _, n in dis.findlinestarts(block) if n is not None)
+            for const in block.co_consts:
+                if isinstance(const, types.CodeType):
+                    visit(const)
+        visit(code)
+        return lines
 
     @staticmethod
     def bindings(function):
@@ -257,6 +320,7 @@ class Evidence:
             base = self.deps.select_lines({path: old_changes[path]})
             if not path.endswith(".py"):
                 chosen.update(base)
+                chosen.update(self.lifecycle_hits(path, {0}))
                 continue
             source, before = self.source(path)
             updated = apply_hunks(source, hunks)
@@ -268,9 +332,14 @@ class Evidence:
                 re.search(r"coding[:=]|^#!", x) for x in (source.splitlines()[:2] + updated.splitlines()[:2])
             ):
                 chosen.update(base)
+                chosen.update(self.lifecycle_hits(path, old_changes[path]))
                 continue
             for delta in differences(before, after):
                 part = self.masks_for_change(path, before, after, delta)
+                inside_function = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                      for n in ancestors(before, delta))
+                if inside_function or part is None or part & self.startup:
+                    chosen.update(self.lifecycle_hits(path, old_changes[path]))
                 if part is None or part & self.startup:
                     chosen.update(self.ordinary(path, before, after, delta, base))
                 else:
