@@ -1,5 +1,6 @@
 """Interpret a patch using source and execution evidence from the pinned revision."""
 import ast
+from os.path import commonprefix
 import dis
 from functools import lru_cache
 import gzip
@@ -8,6 +9,7 @@ import operator
 from pathlib import Path, PurePosixPath
 import re
 import types
+from structure import aligned, changed_dispatch_keys
 
 
 HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -164,6 +166,29 @@ class Evidence:
         facts = self.sites.get(site, {})
         return self.masks[facts[key]] if key in facts else 0
 
+    @lru_cache(maxsize=1024)
+    def setting_reads(self, site, key):
+        mask = self.fact(site, key)
+        if not mask & self.startup:
+            return mask
+        prefix = key + "|"
+        origins = [k[len(prefix):] for k in self.sites.get("origin:" + site, {}) if k.startswith(prefix)]
+        cold = self.fact("cold:" + site, key)
+        if not cold or not origins or not self.imports or self.imports.get("unverified"):
+            return mask
+        for path in origins:
+            module = path[:-3].replace("/", ".").removesuffix(".__init__")
+            if not path.startswith("sqlglot/") or module not in self.imports["modules"]:
+                return mask
+            cold |= self.module_mask(path)
+        return (mask & ~self.startup) | cold
+
+    @lru_cache(maxsize=128)
+    def module_mask(self, path):
+        readers = self.import_dependents(path)
+        return sum(1 << i for i, test in enumerate(self.deps.ids) if self.deps.number.get(test) in readers)
+
+    @lru_cache(maxsize=128)
     def import_dependents(self, path):
         name = path[:-3].replace("/", ".").removesuffix(".__init__")
         modules = self.imports.get("modules", {})
@@ -182,8 +207,34 @@ class Evidence:
         text = (self.root / path).read_text(encoding="utf-8-sig")
         return text, ast.parse(text)
 
-    def masks_for_change(self, path, before, after, delta, isolated=False):
-        a, b = ancestors(before, delta), ancestors(after, delta)
+    def masks_for_change(self, path, before, after, delta, isolated=False, new_delta=None):
+        a = ancestors(before, delta)
+        b = ancestors(after, delta if new_delta is None else new_delta)
+        for x, y in zip(a, b):
+            if (isinstance(x, ast.BoolOp) and isinstance(y, ast.BoolOp) and type(x.op) is not type(y.op)
+                and len(x.values) == len(y.values) == 2
+                and all(tree_key(s) == tree_key(t) for s, t in zip(x.values, y.values))):
+                prop = f"property-guard:{path}:{x.lineno}:{x.col_offset}"
+                if isolated and self.fact(prop,"ran") and not self.fact(prop,"ran") & self.startup:
+                    return self.fact(prop,"possible")
+                site = f"branch:{path}:{x.lineno}:{x.col_offset}"
+                if self.fact(site, "ran"):
+                    return self.fact(site, "different")
+        for old, new in reversed(list(zip(a, b))):
+            if not isinstance(old, ast.Call) or not isinstance(new, ast.Call):
+                continue
+            if a[-1] is not old.keywords or len(old.keywords) != len(new.keywords) + 1:
+                continue
+            if (tree_key(old.func) != tree_key(new.func) or len(old.args) != len(new.args)
+                or any(tree_key(x) != tree_key(y) for x, y in zip(old.args, new.args))):
+                continue
+            for i, kw in enumerate(old.keywords):
+                if not kw.arg or not all(tree_key(x) == tree_key(y) for x, y in zip(
+                    old.keywords[:i] + old.keywords[i+1:], new.keywords)):
+                    continue
+                site = f"kw:{path}:{old.lineno}:{old.col_offset}:{kw.arg}"
+                if self.fact(site, "ran"):
+                    return self.fact(site, "effect")
         for old, new in reversed(list(zip(a, b))):
             if not isinstance(old, ast.Compare) or not isinstance(new, ast.Compare):
                 continue
@@ -198,12 +249,24 @@ class Evidence:
                 for value in self.sites[numeric]:
                     if value != "unknown" and (left_op(int(value), old.comparators[0].value)
                                                != right_op(int(value), new.comparators[0].value)):
-                        result |= self.fact(numeric, value)
+                        empty = f"empty:{path}:{old.lineno}:{old.col_offset}"
+                        if value == "0" and isolated and self.fact(empty, "ran"):
+                            result |= self.fact(empty, "unknown")
+                        else:
+                            result |= self.fact(numeric, value)
                 return result
             if (len(old.ops) != 1 or len(new.ops) != 1 or tree_key(old.left) != tree_key(new.left)
                 or tree_key(old.comparators[0]) != tree_key(new.comparators[0])):
                 continue
             pair = {type(old.ops[0]).__name__, type(new.ops[0]).__name__}
+            if pair in ({"Is","Eq"},{"IsNot","NotEq"}):
+                identity = f"none:{path}:{old.lineno}:{old.col_offset}"
+                if self.fact(identity, "ran"):
+                    return self.fact(identity, "possible")
+            if isolated and pair == {"Eq","NotEq"}:
+                masked = f"masked:{path}:{old.lineno}:{old.col_offset}"
+                if self.fact(masked, "ran"):
+                    return self.fact(masked, "possible")
             site = f"{path}:{old.lineno}:{old.col_offset}:cmp"
             if site not in self.sites:
                 continue
@@ -228,6 +291,13 @@ class Evidence:
                 old_val, new_val = assign.value, updated.value
                 if isinstance(old_val, ast.Dict) and isinstance(new_val, ast.Dict):
                     dispatch = f"{path}:{old_val.lineno}:{old_val.col_offset}:dispatch"
+                    if a[-1] is old_val and self.fact(dispatch, "registered"):
+                        keys = changed_dispatch_keys(old_val, new_val)
+                        if keys is not None:
+                            mask = self.fact(dispatch, "all")
+                            for key in keys:
+                                mask |= self.fact(dispatch, "key:" + key)
+                            return mask
                     if self.fact(dispatch, "registered") and len(old_val.keys) == len(new_val.keys):
                         for key, replacement in zip(old_val.keys, new_val.keys):
                             if (isinstance(key, ast.Constant) and any(key is n for n in a)
@@ -248,6 +318,13 @@ class Evidence:
                                     ast.literal_eval(new_val.values[index])
                                 except (ValueError, TypeError, SyntaxError):
                                     return None
+                                validator = f"validator:{path}:{old_val.lineno}:{old_val.col_offset}"
+                                if (isolated and self.fact(validator, "validated") and type(key.value) is str
+                                    and isinstance(expr, ast.Constant) and type(expr.value) is bool
+                                    and isinstance(new_val.values[index], ast.Constant)
+                                    and type(new_val.values[index].value) is bool):
+                                    return (self.fact(validator, "invalid:" + key.value)
+                                            | self.fact(validator, "v:" + repr(key.value)) | self.fact(validator, "all"))
                                 return self.fact(mapping, "v:" + repr(key.value)) | self.fact(mapping, "all")
                             site = f"{path}:{expr.lineno}:{expr.col_offset}:callback"
                             if self.fact(site, "registered") and not self.fact(site, "opaque"):
@@ -276,6 +353,34 @@ class Evidence:
                     site = f"attr:{base}:{target.id}"
                     scalar = f"scalar:{base}:{target.id}"
                     guard = f"guard:{base}:{target.id}"
+                    forwarded = f"forward:{base}:{target.id}"
+                    channels = [key for key in self.sites.get(forwarded,{}) if key.startswith("slot-use:")]
+                    if (isolated and channels and isinstance(old_val,ast.Constant) and isinstance(new_val,ast.Constant)
+                        and type(old_val.value) is bool and type(new_val.value) is bool):
+                        mask = (self.fact(forwarded,"direct") | self.setting_reads(f"classdict:{base}","all")
+                                | self.setting_reads(f"classdict:{base}","key:" + target.id))
+                        for channel in channels:
+                            mask |= self.fact(channel,"used")
+                        if not mask & self.startup:
+                            return mask
+                    switch = f"switch:{base}:{target.id}"
+                    if (isolated and self.fact(switch,"analyzed") and not self.fact(switch,"read") & self.startup
+                        and not self.fact(site,"read") & self.startup and isinstance(old_val,ast.Constant)
+                        and isinstance(new_val,ast.Constant) and type(old_val.value) is bool and type(new_val.value) is bool):
+                        return (self.fact(switch,"read") | self.setting_reads(f"classdict:{base}","all")
+                                | self.setting_reads(f"classdict:{base}","key:" + target.id))
+                    copied = f"copy:{base}:{target.id}"
+                    copy_keys = [k for k in self.sites.get(copied, {}) if k.startswith("writes:")]
+                    if (isolated and copy_keys and isinstance(old_val, ast.Constant) and isinstance(new_val, ast.Constant)
+                        and type(old_val.value) is bool and type(new_val.value) is bool
+                        and not self.fact(site, "read") & self.startup):
+                        readers = self.fact(copied, "read") | self.fact(f"classdict:{base}", "all")
+                        readers |= self.fact(f"classdict:{base}", "key:" + target.id)
+                        for key in copy_keys:
+                            writer = self.fact(copied, key)
+                            consumer = self.fact("copy-consumer:" + key.removeprefix("writes:"), "possible")
+                            readers |= (writer & consumer) | ((writer | consumer) & self.startup)
+                        return readers
                     if (isolated and self.fact(guard, "analyzed") and not self.fact(site, "read") & self.startup
                         and isinstance(old_val, ast.Constant) and isinstance(new_val, ast.Constant)
                         and type(old_val.value) is bool and type(new_val.value) is bool):
@@ -287,19 +392,20 @@ class Evidence:
                     meta = f"metascalar:{base}:{target.id}"
                     if (self.fact(meta, "installed") and isinstance(old_val, ast.Constant)
                         and isinstance(new_val, ast.Constant) and type(old_val.value) is type(new_val.value)):
-                        return (self.fact(meta, "read") | self.fact(site, "read")
-                                | self.fact(f"classdict:{base}", "key:" + target.id)
-                                | self.fact(f"classdict:{base}", "all"))
+                        return (self.setting_reads(meta, "read") | self.setting_reads(site, "read")
+                                | self.setting_reads(f"classdict:{base}", "key:" + target.id)
+                                | self.setting_reads(f"classdict:{base}", "all"))
                     if (self.fact(scalar, "installed") and isinstance(old_val, ast.Constant)
                         and isinstance(new_val, ast.Constant) and type(old_val.value) is type(new_val.value)):
-                        return (self.fact(scalar, "read") | self.fact(f"namespace:{base}", "read")
-                                | self.fact(site, "read"))
+                        return (self.setting_reads(scalar, "read") | self.setting_reads(f"namespace:{base}", "read")
+                                | self.setting_reads(site, "read"))
                     if site in self.sites:
                         return self.fact(site, "read")
         return None
 
-    def ordinary(self, path, before, after, delta, base):
-        a, b = ancestors(before, delta), ancestors(after, delta)
+    def ordinary(self, path, before, after, delta, base, new_delta=None):
+        a = ancestors(before, delta)
+        b = ancestors(after, delta if new_delta is None else new_delta)
         # A boolean precedence change can execute an operand that every
         # baseline test short-circuited. Include entrants to the whole guard.
         expanded = set(base)
@@ -314,6 +420,10 @@ class Evidence:
         i, function = scope[-1]
         if i >= len(delta) or delta[i] != "body" or not self.file_entries(path):
             return expanded
+        if isinstance(b[i], type(function)) and self.generator(function) != self.generator(b[i]):
+            # Calling a generator without iterating it leaves no function-entry
+            # event. Changing between ordinary and lazy calls affects those callers.
+            return self.import_dependents(path) if path.startswith("sqlglot/") else self.deps.all_tests
         # A single-line computed expression with its own bytecode line event
         # cannot influence a test which never entered that statement. Missing
         # coverage on such an executable line represents zero observed hits.
@@ -341,7 +451,10 @@ class Evidence:
         entrants = self.deps.numbers(hits)
         edited = b[i]
         if isinstance(edited, type(function)) and self.bindings(function) != self.bindings(edited):
-            return entrants | expanded
+            # A changed local can affect the whole function, including a nested
+            # closure. A caller must still enter this function to see the change.
+            # Crossing the yield boundary also changes the call protocol itself.
+            return entrants | self.lifecycle_hits(path, range(function.body[0].lineno, function.end_lineno + 1))
         return expanded & entrants
 
     @lru_cache(maxsize=64)
@@ -366,15 +479,170 @@ class Evidence:
                 names.update((type(node).__name__, name) for name in node.names)
         return names
 
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def generator(function):
+        todo = list(function.body)
+        while todo:
+            node = todo.pop()
+            if isinstance(node, (ast.Yield, ast.YieldFrom)):
+                return True
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                todo.extend(ast.iter_child_nodes(node))
+        return False
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def loads_modules(fn):
+        return any(isinstance(n, ast.Call) and
+                   (isinstance(n.func, ast.Name) and n.func.id == "__import__"
+                    or isinstance(n.func, ast.Attribute) and n.func.attr in {"import_module","entry_points"})
+                   for n in ast.walk(fn))
+
+    @staticmethod
+    def predicate_leaves(node):
+        if isinstance(node,ast.BoolOp):
+            return tuple(value for part in node.values for value in Evidence.predicate_leaves(part))
+        return (tree_key(node),)
+
+    def predicate_reach(self,path,nodes,updated):
+        if not self.fact("cold:predicate-catalog","complete"):
+            return None
+        for a,b in reversed(list(zip(nodes,updated))):
+            if isinstance(a,ast.BoolOp) and isinstance(b,ast.BoolOp):
+                matches = self.predicate_leaves(a)==self.predicate_leaves(b)
+            elif isinstance(a,ast.Compare) and isinstance(b,ast.Compare):
+                matches = (tree_key(a.left)==tree_key(b.left) and len(a.ops)==len(b.ops)==1
+                           and tree_key(a.comparators[0])==tree_key(b.comparators[0]))
+            else:
+                continue
+            if matches:
+                site=f"predicate:{path}:{a.lineno}:{a.col_offset}:{type(a).__name__}:{a.end_lineno}:{a.end_col_offset}"
+                if self.fact(site,"registered"):
+                    mask=self.fact(site,"ran")
+                    if mask & self.startup or self.fact("cold:"+site,"ran"):
+                        return None
+                    if any(isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and self.loads_modules(n) for n in nodes):
+                        return None
+                    return mask
+        return None
+
+    @staticmethod
+    def private_to_gap(fn, replacements, names):
+        omitted = {id(n) for stmt in replacements for n in ast.walk(stmt)}
+        if not all(isinstance(name, str) for name in names):
+            return False
+        if any(isinstance(n, ast.Name) and n.id in {"locals", "vars", "eval", "exec", "globals", "super"}
+               or isinstance(n, ast.Attribute) and n.attr in {"f_locals", "_getframe", "currentframe"}
+               for n in ast.walk(fn)):
+            return False
+        return not any(id(n) not in omitted and (isinstance(n, ast.Name) and n.id in names
+                       or isinstance(n, ast.arg) and n.arg in names) for n in ast.walk(fn))
+
     @lru_cache(maxsize=128)
     def file_entries(self, path):
         return [k for k in self.sites if k.startswith(f"fn:{path}:")]
+
+    def statement_gap(self, path, previous, current, gap):
+        i, j, k, l = gap
+        old, new = previous[-1], current[-1]
+        removed, added = old[i:j], new[k:l]
+        funcs = [(ix, n) for ix, n in enumerate(previous) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if funcs:
+            ix, fn = funcs[-1]
+            updated = current[ix]
+            if isinstance(updated, type(fn)) and self.generator(fn) != self.generator(updated):
+                return self.import_dependents(path) if path.startswith("sqlglot/") else self.deps.all_tests
+            start = min([fn.lineno] + [d.lineno for d in fn.decorator_list])
+            owners = [n.name for n in previous[:ix+1] if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))]
+            # Qualnames include <locals> for nested functions.
+            entries = [s for s in self.file_entries(path) if s.startswith(f"fn:{path}:{start}:")
+                       and s.rsplit(":",1)[-1].replace(".<locals>.", ".") == ".".join(owners)]
+            if not entries:
+                return self.import_dependents(path)
+            mask = self.fact(entries[0], "ran")
+            hits = self.deps.numbers(mask & ~self.startup)
+            # File-isolated evidence distinguishes import-time calls from declarations.
+            body_lines = range(fn.body[0].lineno, fn.end_lineno + 1)
+            hits |= self.lifecycle_hits(path, body_lines)
+            # A new local binding, generator or nested scope changes the entire function.
+            different = self.bindings(fn) ^ self.bindings(updated) if isinstance(updated, type(fn)) else set()
+            if (not isinstance(updated, type(fn)) or different and not
+                (self.private_to_gap(fn, removed, different) and self.private_to_gap(updated, added, different))
+                or any(isinstance(n, (ast.Yield, ast.YieldFrom, ast.Await, ast.FunctionDef, ast.ClassDef,
+                                      ast.Global, ast.Nonlocal)) for s in removed + added for n in ast.walk(s))):
+                return hits
+            # A deletion can only matter where one of the deleted statements ran.
+            # At a pure insertion the first old statement following it was reachable
+            # on that path. At the end, reaching the previous statement is necessary.
+            semantic = set()
+            if removed and not added:
+                anchors = []
+                for stmt in removed:
+                    site = f"if:{path}:{stmt.lineno}:{stmt.col_offset}"
+                    if isinstance(stmt, ast.If) and not stmt.orelse and self.fact(site, "registered"):
+                        effects = self.fact(site, "effect")
+                        if not effects & self.startup:
+                            semantic |= self.deps.numbers(effects)
+                            semantic |= self.lifecycle_hits(path, {stmt.lineno})
+                            continue
+                    anchors.append(stmt)
+                if not anchors:
+                    return semantic
+            else:
+                anchors = removed or old[i:i+1] or old[i-1:i]
+            if not anchors:
+                return hits
+            lines = {s.lineno for s in anchors}
+            table = self.deps.files.get(path, {})
+            if not all(str(n) in table for n in lines):
+                return hits
+            selected = set()
+            for n in lines:
+                selected |= self.deps.numbers(self.deps.masks[table[str(n)]])
+            return semantic | (hits & selected) | self.lifecycle_hits(path, lines)
+        classes = [n.name for n in previous if isinstance(n, ast.ClassDef)]
+        if classes and removed and not added:
+            owner = path[:-3].replace("/", ".") + "." + ".".join(classes)
+            readers = self.fact(f"classdict:{owner}", "all") | self.fact(f"namespace:{owner}", "read")
+            for stmt in removed:
+                target = stmt.targets[0] if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 else getattr(stmt, "target", None)
+                if (not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or not isinstance(target, ast.Name)
+                    or not isinstance(stmt.value, ast.Constant) or type(stmt.value.value) not in (str, bool, int)
+                    or isinstance(stmt, ast.AnnAssign)):
+                    break
+                key = target.id
+                scalar, meta = f"scalar:{owner}:{key}", f"metascalar:{owner}:{key}"
+                if not (self.fact(scalar, "installed") or self.fact(meta, "installed")):
+                    break
+                readers |= (self.fact(scalar, "read") | self.fact(meta, "read") | self.fact(f"attr:{owner}:{key}", "read")
+                            | self.fact(f"classdict:{owner}", "key:" + key))
+            else:
+                if not readers & self.startup:
+                    return self.deps.numbers(readers)
+        if classes and removed and not added and all(isinstance(s, ast.FunctionDef) and not s.decorator_list for s in removed):
+            owner = path[:-3].replace("/", ".") + "." + ".".join(classes)
+            mask = self.fact("method-dict:" + owner, "read")
+            for fn in removed:
+                site = f"method:{owner}.{fn.name}"
+                annotations = [n.annotation for n in ast.walk(fn.args) if isinstance(n, ast.arg)] + [fn.returns]
+                postponed = any(isinstance(s, ast.ImportFrom) and s.module == "__future__"
+                                and any(n.name == "annotations" for n in s.names) for s in previous[0].body)
+                if (not self.fact(site, "registered") or fn.args.defaults or any(d is not None for d in fn.args.kw_defaults)
+                    or any(annotations) and not postponed):
+                    break
+                mask |= self.fact(site, "read") | self.fact(f"fn:{path}:{fn.lineno}:{'.'.join(classes)}.{fn.name}", "ran")
+            else:
+                if not mask & self.startup:
+                    return self.deps.numbers(mask)
+        return self.import_dependents(path) if path.startswith("sqlglot/") else self.deps.all_tests
 
     def select(self, diff, old_changes):
         parsed = read_patch(diff)
         if set(parsed) != set(old_changes):
             raise ValueError("unrecognized file in patch")
         chosen = set()
+        python_edits = []
         for path, hunks in parsed.items():
             base = self.deps.select_lines({path: old_changes[path]})
             if not path.endswith(".py"):
@@ -396,19 +664,48 @@ class Evidence:
             if path.startswith("sqlglot/") and self.imports and inserted_raise(before, after):
                 chosen.update(self.import_dependents(path))
                 continue
-            deltas = list(differences(before, after))
-            isolated = len(parsed) == 1 and len(deltas) == 1
-            for delta in deltas:
+            deltas = list(aligned(before, after))
+            python_edits.append((path, before, after, deltas, mask))
+        # Every reader of an edited fixture has already been included. An
+        # independent comment/fixture does not invalidate a single code proof.
+        isolated = sum(len(item[3]) for item in python_edits) == 1
+        changed_files = sum(bool(item[3]) for item in python_edits)
+        for path, before, after, deltas, mask in python_edits:
+            per_file = set()
+            reach = None
+            if changed_files == 1 and deltas and all(gap is None for _,_,gap in deltas):
+                # All code edits must belong to this expression. Two separate
+                # edits can enable a short-circuited operand for the first time.
+                old_path = commonprefix([old for old,_,_ in deltas])
+                new_path = commonprefix([new for _,new,_ in deltas])
+                reach = self.predicate_reach(path,ancestors(before,old_path),ancestors(after,new_path))
+            for delta, updated_delta, gap in deltas:
                 nodes = ancestors(before, delta)
+                if gap is not None:
+                    updated_nodes = ancestors(after, updated_delta)
+                    per_file.update(self.statement_gap(path, nodes, updated_nodes, gap))
+                    continue
                 lines = semantic_lines(nodes, old_changes[path])
-                part = self.masks_for_change(path, before, after, delta, isolated)
+                part = self.masks_for_change(path, before, after, delta, isolated, updated_delta)
+                if reach is not None and (part is None or not part & self.startup):
+                    mask |= reach if part is None else part & reach
+                    continue
                 inside_function = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                                       for n in nodes)
                 if inside_function or part is None or part & self.startup:
-                    chosen.update(self.lifecycle_hits(path, lines))
+                    per_file.update(self.lifecycle_hits(path, lines))
                 if part is None or part & self.startup:
-                    chosen.update(self.ordinary(path, before, after, delta, self.deps.select_lines({path: lines})))
+                    ordinary = self.ordinary(path, before, after, delta, self.deps.select_lines({path: lines}), updated_delta)
+                    # A change during module construction can affect later lazy
+                    # imports even when their individual tests never hit this line.
+                    funcs = [n for n in nodes if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))]
+                    if (funcs and self.imports and path.startswith("sqlglot/") and
+                        (self.loads_modules(funcs[-1]) or self.lifecycle_hits(path,lines))):
+                        ordinary = self.import_dependents(path)
+                    if ordinary == self.deps.all_tests and self.imports and path.startswith("sqlglot/"):
+                        ordinary = self.import_dependents(path)
+                    per_file.update(ordinary)
                 else:
                     mask |= part
-            chosen.update(self.deps.numbers(mask))
+            chosen.update(per_file | self.deps.numbers(mask))
         return chosen | self.deps.unverified | self.unverified

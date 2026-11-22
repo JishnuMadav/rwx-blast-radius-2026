@@ -3,6 +3,7 @@
 !selector.py
 !coverage.json.gz
 !witness.py
+!structure.py
 !semantics.json.gz
 !lifecycle.json.gz
 !imports.json.gz

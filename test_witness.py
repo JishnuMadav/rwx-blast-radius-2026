@@ -3,10 +3,92 @@ import unittest
 from pathlib import Path
 
 from selector import Dependencies
+from structure import aligned, changed_dispatch_keys
 from witness import Evidence, ancestors, apply_hunks, differences, inserted_raise, read_patch, semantic_lines
 
 
 class WitnessTests(unittest.TestCase):
+    def test_regrouped_predicates_retain_cold_and_lazy_readers(self):
+        before = ast.parse("def f(a,b,c):\n return a and b and c")
+        after = ast.parse("def f(a,b,c):\n return a and b or c")
+        a,b=before.body[0].body[0].value,after.body[0].body[0].value
+        ids=["unused","reached"]
+        dep=Dependencies({"ids":ids,"files":{},"masks":[],"function_ranges":{},"unverified":[]},
+                         [{"id":name,"number":i} for i,name in enumerate(ids)])
+        site=f"predicate:m.py:{a.lineno}:{a.col_offset}:BoolOp:{a.end_lineno}:{a.end_col_offset}"
+        facts={"cold:predicate-catalog":{"complete":0},site:{"registered":0,"ran":1}}
+        ev=Evidence(Path("."),{"ids":ids,"facts":facts,"masks":["3","2","4"]},dep)
+        self.assertEqual(ev.predicate_reach("m.py",[before.body[0],a],[after.body[0],b]),2)
+        other=ast.parse("a and b or d",mode="eval").body
+        self.assertIsNone(ev.predicate_reach("m.py",[a],[other]))
+        facts["cold:"+site]={"ran":1}
+        self.assertIsNone(ev.predicate_reach("m.py",[a],[b]))
+        del facts["cold:"+site]
+        facts[site]["ran"]=2
+        self.assertIsNone(ev.predicate_reach("m.py",[a],[b]))
+    def test_deleting_a_method_does_not_reassign_the_next_delta(self):
+        left = ast.parse("class C:\n def old(self): return 0\n def stay(self): return 1")
+        right = ast.parse("class C:\n def stay(self): return 2")
+        items = list(aligned(left, right))
+        self.assertEqual([gap for _,_,gap in items if gap], [(0,1,0,0)])
+        oldpath,newpath,_ = next(x for x in items if x[2] is None)
+        self.assertEqual(ancestors(left,oldpath)[-1], 1)
+        self.assertEqual(ancestors(right,newpath)[-1], 2)
+
+    def test_table_edits_keep_unpack_order_and_opaque_evaluation(self):
+        table = lambda s: ast.parse(s,mode="eval").body
+        self.assertEqual(changed_dispatch_keys(table("{**base, 'a': 1}"),table("{'a': 1, **base}")),{"a"})
+        self.assertIsNone(changed_dispatch_keys(table("{**a, 'x': 0}"),table("{**b, 'x': 0}")))
+        self.assertIsNone(changed_dispatch_keys(table("{}"),table("{'x': make()}")))
+
+    def test_binding_private_to_deletion_requires_all_uses_inside(self):
+        f = ast.parse("def f(x):\n if x:\n  tmp = 1\n return 0").body[0]
+        self.assertTrue(Evidence.private_to_gap(f,[f.body[0]],{"tmp"}))
+        f.body[-1] = ast.parse("return tmp").body[0]
+        self.assertFalse(Evidence.private_to_gap(f,[f.body[0]],{"tmp"}))
+        f.body[-1] = ast.parse("return locals()").body[0]
+        self.assertFalse(Evidence.private_to_gap(f,[f.body[0]],{"tmp"}))
+
+    def test_generator_boundary_includes_uniterated_callers(self):
+        first = ast.parse("def f():\n yield 1\n return")
+        second = ast.parse("def f():\n return")
+        ids=["iterated","uniterated"]
+        dep=Dependencies({"ids":ids,"files":{},"masks":[],"function_ranges":{},"unverified":[]},
+                         [{"id":n,"number":i} for i,n in enumerate(ids)])
+        ev=Evidence(Path("."),{"ids":ids,"facts":{},"masks":[]},dep)
+        a,b,gap=next(aligned(first,second))
+        self.assertEqual(ev.statement_gap("sqlglot/example.py",ancestors(first,a),ancestors(second,b),gap),{0,1})
+        outer=ast.parse("def f():\n def g():\n  yield 1\n return g").body[0]
+        self.assertFalse(Evidence.generator(outer))
+
+    def test_unknown_startup_origin_keeps_fallback(self):
+        ids=["a","b"]
+        dep=Dependencies({"ids":ids,"files":{},"masks":[],"function_ranges":{},"unverified":[]},
+                         [{"id":n,"number":i} for i,n in enumerate(ids)])
+        ev=Evidence(Path("."),{"ids":ids,"facts":{"attr:A:F":{"read":0},"cold:attr:A:F":{"read":1},
+                    "origin:attr:A:F":{"read|unknown":0}},"masks":["4","2"]},dep,
+                    imports={"ids":ids,"modules":{"sqlglot.a":"2"},"unverified":[]})
+        self.assertEqual(ev.setting_reads("attr:A:F","read"),4)
+
+    def test_boolean_map_proof_requires_an_isolated_code_edit(self):
+        before=ast.parse("class C:\n    fields = {'x': True, 'y': False}")
+        after=ast.parse("class C:\n    fields = {'x': False, 'y': False}")
+        ev_ids=["good","missing","reflects"]
+        dep=Dependencies({"ids":ev_ids,"files":{},"masks":[],"function_ranges":{},"unverified":[]},
+                         [{"id":n,"number":i} for i,n in enumerate(ev_ids)])
+        v=before.body[0].body[0].value
+        ordinary=f"demo.py:{v.lineno}:{v.col_offset}:mapping"
+        checked=f"validator:demo.py:{v.lineno}:{v.col_offset}"
+        ev=Evidence(Path("."),{"ids":ev_ids,"masks":["1","2","4","7"],
+                    "facts":{ordinary:{"registered":0,"all":3},checked:{"validated":0,"invalid:x":1,"all":2}}},dep)
+        delta,=differences(before,after)
+        self.assertEqual(ev.masks_for_change("demo.py",before,after,delta,True),6)
+        self.assertEqual(ev.masks_for_change("demo.py",before,after,delta,False),7)
+
+    def test_lazy_import_in_shared_registry_is_recognized(self):
+        fn=ast.parse("def get(key):\n if key not in registry:\n  registry[key]=importlib.import_module(key)\n return registry[key]").body[0]
+        self.assertTrue(Evidence.loads_modules(fn))
+
     def test_import_shortcut_requires_one_unconditional_new_raise(self):
         before = ast.parse("x = 1")
         self.assertTrue(inserted_raise(before, ast.parse("x = 1\nraise ValueError()")))

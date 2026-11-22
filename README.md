@@ -6,16 +6,14 @@ executed lines and functions, fixture and source reads, comparison operands,
 callback invocations, individual dictionary values and scalar class settings.
 Independent cold imports cover each test module. Shared setup dependencies
 cover all member tests, including fixtures opened before individual methods run.
-The selector combines the
-selected tests across files and schedules them on one to eight workers,
+Statement alignment tracks insertions, deletions and changes to adjacent methods
+independently. The selector unions readers across every hunk, includes cold
+module initializers, and schedules the selected tests on one to eight workers,
 including the two-second cost per worker. Unsupported patch formats and
 changes that fail to compile select the full catalog.
 
-The candidate scored 103.410 simulated seconds with zero misses on the 30
-development sample changes. On a separate 40-patch validation batch it scored
-116.500 simulated seconds with zero misses. The previously submitted version
-scored 544.197 simulated seconds on that same batch, including one missed
-commit. The organizer adds CPU time on top of each simulated score.
+The organizer charges the scheduled worker time plus the selector's CPU time.
+Every patch that omits a failing test adds a 300-second penalty.
 
 ## Run the official sample
 
@@ -49,7 +47,11 @@ python profile_scalars.py .local/sqlglot .local/sample/sample/tests.json .local/
 python profile_dispatch.py .local/sqlglot .local/sample/sample/tests.json .local/dispatch-map.gz
 python profile_class_reads.py .local/sqlglot .local/sample/sample/tests.json .local/class-map.gz
 python profile_guards.py .local/sqlglot .local/sample/sample/tests.json .local/guard-map.gz
-python merge_profiles.py semantics.json.gz .local/operand-map.gz .local/scalar-map.gz .local/dispatch-map.gz .local/class-map.gz .local/guard-map.gz
+for family in methods effects branches copies identity switches validators cold_reads startup predicates forwarding properties; do
+  python "profile_${family}.py" .local/sqlglot .local/sample/sample/tests.json ".local/${family}-map.gz"
+done
+python profile_cold_reads.py .local/sqlglot .local/sample/sample/tests.json .local/cold-predicate-map.gz --predicates
+python merge_profiles.py semantics.json.gz .local/operand-map.gz .local/scalar-map.gz .local/dispatch-map.gz .local/class-map.gz .local/guard-map.gz .local/methods-map.gz .local/effects-map.gz .local/branches-map.gz .local/copies-map.gz .local/identity-map.gz .local/switches-map.gz .local/validators-map.gz .local/cold_reads-map.gz .local/startup-map.gz .local/predicates-map.gz .local/cold-predicate-map.gz .local/forwarding-map.gz .local/properties-map.gz
 python profile_lifecycle.py .local/sqlglot .local/sample/sample/tests.json lifecycle.json.gz
 python profile_imports.py .local/sqlglot .local/sample/sample/tests.json imports.json.gz
 ~~~
