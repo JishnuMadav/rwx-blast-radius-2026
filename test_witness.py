@@ -3,10 +3,48 @@ import unittest
 from pathlib import Path
 
 from selector import Dependencies
-from witness import Evidence, apply_hunks, differences, read_patch
+from witness import Evidence, ancestors, apply_hunks, differences, inserted_raise, read_patch, semantic_lines
 
 
 class WitnessTests(unittest.TestCase):
+    def test_import_shortcut_requires_one_unconditional_new_raise(self):
+        before = ast.parse("x = 1")
+        self.assertTrue(inserted_raise(before, ast.parse("x = 1\nraise ValueError()")))
+        self.assertFalse(inserted_raise(before, ast.parse("x = 2\nraise ValueError()")))
+        self.assertFalse(inserted_raise(before, ast.parse("x = 1\nif x:\n    raise ValueError()")))
+
+    def test_private_list_writes_keep_live_consumers(self):
+        old = ast.parse("class C:\n    FLAG = False")
+        new = ast.parse("class C:\n    FLAG = True")
+        ids = list("abcd")
+        dep = Dependencies({"ids": ids, "masks": [], "files": {}, "function_ranges": {}, "unverified": []},
+                           [{"id": n, "number": i} for i, n in enumerate(ids)])
+        facts = {"guard:demo.C:FLAG": {"installed": 0, "analyzed": 1, "append": 2, "read": 3},
+                 "consumer:FLAG": {"possible": 4}, "attr:demo.C:FLAG": {"read": 1}}
+        ev = Evidence(Path("."), {"ids": ids, "masks": ["10", "f", "3", "4", "a"], "facts": facts}, dep)
+        delta, = differences(old, new)
+        self.assertEqual(ev.masks_for_change("demo.py", old, new, delta, isolated=True), 6)
+        self.assertEqual(ev.masks_for_change("demo.py", old, new, delta, isolated=False), 15)
+
+    def test_shifted_type_ignore_does_not_invalidate_module(self):
+        source = "import sys\n\ndef f(x):\n    return x == 1  # type: ignore[comparison-overlap]\n"
+        before = ast.parse(source)
+        after = ast.parse("# moved down\n" + source.replace("== 1", "== 2"))
+        delta, = differences(before, after)
+        self.assertEqual(semantic_lines(ancestors(before, delta), {1, 4}), {4})
+
+    def test_key_rename_keeps_both_names_and_whole_table_readers(self):
+        before = ast.parse("class Demo:\n    MAP = {'old': lambda: 1}")
+        after = ast.parse("class Demo:\n    MAP = {'new': lambda: 1}")
+        catalog = list("abcd")
+        dep = Dependencies({"ids": catalog, "masks": [], "files": {}, "function_ranges": {}, "unverified": []},
+                           [{"id": n, "number": i} for i, n in enumerate(catalog)])
+        site = {"registered": 0, "key:old": 1, "key:new": 2, "all": 3, "key:other": 4}
+        ev = Evidence(Path("."), {"ids": catalog, "masks": ["10", "1", "2", "4", "8"],
+                                  "facts": {"demo.py:2:10:dispatch": site}}, dep)
+        delta, = differences(before, after)
+        self.assertEqual(ev.masks_for_change("demo.py", before, after, delta), 7)
+
     def test_lifecycle_mask_uses_live_catalog_numbers(self):
         model = {"ids": ["test_a", "test_b"], "masks": [], "unverified": [], "files": {}, "function_ranges": {}}
         deps = Dependencies(model, [{"id": "test_a", "number": 17}, {"id": "test_b", "number": 3}])

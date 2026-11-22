@@ -113,8 +113,27 @@ def ancestors(tree, path):
     return nodes
 
 
+def semantic_lines(nodes, changed):
+    for node in reversed(nodes):
+        if isinstance(node, ast.AST) and hasattr(node, "lineno"):
+            anchored = {line for line in changed if node.lineno <= line <= node.end_lineno}
+            return anchored or changed
+    return changed
+
+
+def inserted_raise(before, after):
+    if len(after.body) != len(before.body) + 1:
+        return False
+    for i, statement in enumerate(after.body):
+        if isinstance(statement, ast.Raise):
+            remainder = after.body[:i] + after.body[i + 1:]
+            if all(tree_key(a) == tree_key(b) for a, b in zip(before.body, remainder)):
+                return True
+    return False
+
+
 class Evidence:
-    def __init__(self, root, data, deps, lifecycle=None):
+    def __init__(self, root, data, deps, lifecycle=None, imports=None):
         self.root = root
         self.deps = deps
         self.sites = data["facts"]
@@ -128,6 +147,9 @@ class Evidence:
             raise ValueError("lifecycle profile catalog differs")
         self.lifecycle = lifecycle["files"]
         self.lifecycle_masks = [int(value, 16) for value in lifecycle["masks"]]
+        if imports is not None and imports["ids"] != deps.ids:
+            raise ValueError("isolated import catalog differs")
+        self.imports = imports or {}
 
     def lifecycle_hits(self, path, lines):
         covered = self.lifecycle.get(path, {})
@@ -142,12 +164,25 @@ class Evidence:
         facts = self.sites.get(site, {})
         return self.masks[facts[key]] if key in facts else 0
 
+    def import_dependents(self, path):
+        name = path[:-3].replace("/", ".").removesuffix(".__init__")
+        modules = self.imports.get("modules", {})
+        if name not in modules:
+            return self.deps.all_tests
+        mask = int(modules[name], 16) | (self.fact("read:" + path, "read") & ~self.startup)
+        for index in set(self.deps.files.get(path, {}).values()):
+            mask |= self.deps.masks[index]
+        for index in set(self.lifecycle.get(path, {}).values()):
+            mask |= self.lifecycle_masks[index]
+        skipped = {self.deps.number[test] for test in self.imports["unverified"] if test in self.deps.number}
+        return self.deps.numbers(mask) | skipped
+
     @lru_cache(maxsize=96)
     def source(self, path):
         text = (self.root / path).read_text(encoding="utf-8-sig")
-        return text, ast.parse(text, type_comments=True)
+        return text, ast.parse(text)
 
-    def masks_for_change(self, path, before, after, delta):
+    def masks_for_change(self, path, before, after, delta, isolated=False):
         a, b = ancestors(before, delta), ancestors(after, delta)
         for old, new in reversed(list(zip(a, b))):
             if not isinstance(old, ast.Compare) or not isinstance(new, ast.Compare):
@@ -192,6 +227,15 @@ class Evidence:
             if isinstance(target, ast.Name):
                 old_val, new_val = assign.value, updated.value
                 if isinstance(old_val, ast.Dict) and isinstance(new_val, ast.Dict):
+                    dispatch = f"{path}:{old_val.lineno}:{old_val.col_offset}:dispatch"
+                    if self.fact(dispatch, "registered") and len(old_val.keys) == len(new_val.keys):
+                        for key, replacement in zip(old_val.keys, new_val.keys):
+                            if (isinstance(key, ast.Constant) and any(key is n for n in a)
+                                and isinstance(replacement, ast.Constant)
+                                and type(key.value) is str and type(replacement.value) is str):
+                                return (self.fact(dispatch, "key:" + key.value)
+                                        | self.fact(dispatch, "key:" + replacement.value)
+                                        | self.fact(dispatch, "all"))
                     for index, expr in enumerate(old_val.values):
                         if any(expr is v for v in a):
                             mapping = f"{path}:{old_val.lineno}:{old_val.col_offset}:mapping"
@@ -231,6 +275,21 @@ class Evidence:
                     base = path[:-3].replace("/", ".") + "." + ".".join(classes)
                     site = f"attr:{base}:{target.id}"
                     scalar = f"scalar:{base}:{target.id}"
+                    guard = f"guard:{base}:{target.id}"
+                    if (isolated and self.fact(guard, "analyzed") and not self.fact(site, "read") & self.startup
+                        and isinstance(old_val, ast.Constant) and isinstance(new_val, ast.Constant)
+                        and type(old_val.value) is bool and type(new_val.value) is bool):
+                        writer = self.fact(guard, "append")
+                        consumer = self.fact("consumer:" + target.id, "possible")
+                        return (self.fact(guard, "read") | self.fact(f"classdict:{base}", "all")
+                                | self.fact(f"classdict:{base}", "key:" + target.id)
+                                | (writer & consumer) | ((writer | consumer) & self.startup))
+                    meta = f"metascalar:{base}:{target.id}"
+                    if (self.fact(meta, "installed") and isinstance(old_val, ast.Constant)
+                        and isinstance(new_val, ast.Constant) and type(old_val.value) is type(new_val.value)):
+                        return (self.fact(meta, "read") | self.fact(site, "read")
+                                | self.fact(f"classdict:{base}", "key:" + target.id)
+                                | self.fact(f"classdict:{base}", "all"))
                     if (self.fact(scalar, "installed") and isinstance(old_val, ast.Constant)
                         and isinstance(new_val, ast.Constant) and type(old_val.value) is type(new_val.value)):
                         return (self.fact(scalar, "read") | self.fact(f"namespace:{base}", "read")
@@ -325,7 +384,7 @@ class Evidence:
             source, before = self.source(path)
             updated = apply_hunks(source, hunks)
             compile(updated, path, "exec", dont_inherit=True)
-            after = ast.parse(updated, type_comments=True)
+            after = ast.parse(updated)
             mask = self.fact("read:" + path, "read") & ~self.startup
             # Treat encoding declarations and interpreter directives conservatively.
             if source.splitlines()[:2] != updated.splitlines()[:2] and any(
@@ -334,14 +393,21 @@ class Evidence:
                 chosen.update(base)
                 chosen.update(self.lifecycle_hits(path, old_changes[path]))
                 continue
-            for delta in differences(before, after):
-                part = self.masks_for_change(path, before, after, delta)
+            if path.startswith("sqlglot/") and self.imports and inserted_raise(before, after):
+                chosen.update(self.import_dependents(path))
+                continue
+            deltas = list(differences(before, after))
+            isolated = len(parsed) == 1 and len(deltas) == 1
+            for delta in deltas:
+                nodes = ancestors(before, delta)
+                lines = semantic_lines(nodes, old_changes[path])
+                part = self.masks_for_change(path, before, after, delta, isolated)
                 inside_function = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                                      for n in ancestors(before, delta))
+                                      for n in nodes)
                 if inside_function or part is None or part & self.startup:
-                    chosen.update(self.lifecycle_hits(path, old_changes[path]))
+                    chosen.update(self.lifecycle_hits(path, lines))
                 if part is None or part & self.startup:
-                    chosen.update(self.ordinary(path, before, after, delta, base))
+                    chosen.update(self.ordinary(path, before, after, delta, self.deps.select_lines({path: lines})))
                 else:
                     mask |= part
             chosen.update(self.deps.numbers(mask))

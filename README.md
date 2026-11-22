@@ -46,14 +46,18 @@ python build_map.py .local/sqlglot .local/sample/sample/tests.json coverage.json
 python verify_coverage.py .local/sqlglot coverage.json.gz coverage.json.gz
 python profile_semantics.py .local/sqlglot .local/sample/sample/tests.json .local/operand-map.gz
 python profile_scalars.py .local/sqlglot .local/sample/sample/tests.json .local/scalar-map.gz
-python merge_profiles.py semantics.json.gz .local/operand-map.gz .local/scalar-map.gz
+python profile_dispatch.py .local/sqlglot .local/sample/sample/tests.json .local/dispatch-map.gz
+python profile_class_reads.py .local/sqlglot .local/sample/sample/tests.json .local/class-map.gz
+python profile_guards.py .local/sqlglot .local/sample/sample/tests.json .local/guard-map.gz
+python merge_profiles.py semantics.json.gz .local/operand-map.gz .local/scalar-map.gz .local/dispatch-map.gz .local/class-map.gz .local/guard-map.gz
 python profile_lifecycle.py .local/sqlglot .local/sample/sample/tests.json lifecycle.json.gz
+python profile_imports.py .local/sqlglot .local/sample/sample/tests.json imports.json.gz
 ~~~
 
 For a faster semantic profile, start multiple copies with the same
 `--shards N` and distinct `--shard` indices from zero through N minus one.
-Give each copy its own gzip output. Run
-`python merge_profiles.py semantics.json.gz shard-*.gz` after all copies finish.
+Give each copy its own gzip output. Merge the shards of each profile first
+and verify all catalog tests passed before combining the profile families.
 
 The map is derived from the unmodified SQLGlot revision. The measurement
 records test execution in the pytest process, including setup and teardown.

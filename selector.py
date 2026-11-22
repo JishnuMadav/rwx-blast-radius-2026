@@ -121,6 +121,7 @@ def main():
     p.add_argument("--evidence", type=Path, default=Path(__file__).with_name("semantics.json.gz"))
     p.add_argument("--source", type=Path, default=Path("/opt/sqlglot"))
     p.add_argument("--lifecycle", type=Path, default=Path(__file__).with_name("lifecycle.json.gz"))
+    p.add_argument("--imports", type=Path, default=Path(__file__).with_name("imports.json.gz"))
     args = p.parse_args()
     tests = json.loads((args.data / "tests.json").read_bytes())["tests"]
     costs = {t["number"]: round(1000 * t["seconds"]) for t in tests}
@@ -133,8 +134,12 @@ def main():
         if args.lifecycle.is_file():
             with gzip.open(args.lifecycle, "rb") as f:
                 lifecycle = json.load(f)
+        imports = None
+        if args.imports.is_file():
+            with gzip.open(args.imports, "rb") as f:
+                imports = json.load(f)
         with gzip.open(args.evidence, "rb") as f:
-            evidence = Evidence(args.source, json.load(f), deps, lifecycle)
+            evidence = Evidence(args.source, json.load(f), deps, lifecycle, imports)
     cache = {}
     for patch in sorted((args.data / "commits").glob("*.patch")):
         diff = patch.read_text(encoding="utf8", errors="replace")
